@@ -3,8 +3,8 @@ import logging
 from datetime import datetime, timedelta
 
 # Lambda 환경에 맞게 import 경로 수정
-# from idle_detector import IdleVolumeDetector # 주석 처리
-# from overprovisioned_detector import OverprovisionedVolumeDetector # 주석 처리
+from idle_detector import IdleVolumeDetector # 주석 처리 -> 주석 해제
+from overprovisioned_detector import OverprovisionedVolumeDetector # 주석 처리 -> 주석 해제
 from config import EBS_IDLE_VOLUME_CRITERIA as IDLE_VOLUME_CRITERIA, \
                     EBS_OVERPROVISIONED_CRITERIA as OVERPROVISIONED_CRITERIA, \
                     EBS_METRIC_PERIOD as METRIC_PERIOD
@@ -27,20 +27,20 @@ class EBSAnalyzer:
         self.ec2_client = boto3.client('ec2', region_name=region)
         self.cloudwatch_client = boto3.client('cloudwatch', region_name=region)
 
-        # 감지기 초기화 - 임시 주석 처리
-        # self.idle_detector = IdleVolumeDetector(
-        #     region,
-        #     self.ec2_client,
-        #     self.cloudwatch_client,
-        #     IDLE_VOLUME_CRITERIA
-        # )
+        # 감지기 초기화
+        self.idle_detector = IdleVolumeDetector(
+            region,
+            self.ec2_client,
+            self.cloudwatch_client,
+            IDLE_VOLUME_CRITERIA
+        )
 
-        # self.overprovisioned_detector = OverprovisionedVolumeDetector(
-        #     region,
-        #     self.ec2_client,
-        #     self.cloudwatch_client,
-        #     OVERPROVISIONED_CRITERIA
-        # )
+        self.overprovisioned_detector = OverprovisionedVolumeDetector(
+            region,
+            self.ec2_client,
+            self.cloudwatch_client,
+            OVERPROVISIONED_CRITERIA
+        )
 
     def get_all_ebs_volumes(self):
         """
@@ -244,53 +244,86 @@ class EBSAnalyzer:
                 "results": []
             }
 
-        # 유휴 상태 볼륨 감지 - 임시 주석 처리
-        # idle_volumes_details = self.idle_detector.detect_idle_volumes(volumes_to_process)
-        idle_volumes_details = {} # 임시 빈 딕셔너리 반환
+        # 유휴 상태 볼륨 감지
+        idle_volumes_details = self.idle_detector.detect_idle_volumes(volumes_to_process)
 
-        # 과대 프로비저닝된 볼륨 감지 - 임시 주석 처리
+        # 과대 프로비저닝 볼륨 감지 (OverprovisionedDetector가 있다면 유사하게 수정)
         # overprovisioned_volumes_details = self.overprovisioned_detector.detect_overprovisioned_volumes(volumes_to_process)
-        overprovisioned_volumes_details = {} # 임시 빈 딕셔너리 반환
+        # overprovisioned_volumes_details = {} # 임시 코드 예시
 
-        analysis_results = []
-        # 분석 로직은 유지 (감지기 결과 사용 부분 제외)
+        # 분석 결과 종합 (이 부분은 detector의 결과를 사용하도록 수정 필요)
+        # 현재 코드는 각 볼륨을 format_volume_info로 처리하고 is_idle 등을 직접 판단하려 함
+        # 이를 idle_volumes_details와 overprovisioned_volumes_details를 사용하도록 변경해야 함
+
+        results = []
+        all_formatted_volumes = {} # 모든 볼륨의 포맷된 정보를 저장 (중복 포맷팅 방지)
+
         for volume in volumes_to_process:
-            formatted_info = self.format_volume_info(volume)
+            formatted_volume = self.format_volume_info(volume) # 기본 정보 포맷팅
+            all_formatted_volumes[volume['VolumeId']] = formatted_volume
+            # detector 결과와 매칭하기 위해 일단 모든 볼륨을 포맷팅
 
-            # 감지 결과 통합 (현재는 비어 있음)
-            volume_id = formatted_info['volume_id']
-            formatted_info['is_idle'] = idle_volumes_details.get(volume_id, {}).get('is_idle', False)
-            formatted_info['idle_reason'] = idle_volumes_details.get(volume_id, {}).get('reason')
-            formatted_info['is_overprovisioned'] = overprovisioned_volumes_details.get(volume_id, {}).get('is_overprovisioned', False)
-            formatted_info['overprovisioned_reason'] = overprovisioned_volumes_details.get(volume_id, {}).get('reason')
+        # idle_volumes_details (리스트)를 순회하며 결과 업데이트
+        processed_idle_ids = set()
+        for idle_detail in idle_volumes_details: # idle_volumes_details는 리스트여야 함
+            vol_id = idle_detail['volume_id']
+            if vol_id in all_formatted_volumes:
+                # 기존 포맷된 정보에 유휴 분석 결과 추가
+                # all_formatted_volumes[vol_id].update(idle_detail) # 이렇게 하면 키가 겹칠 수 있음
+                all_formatted_volumes[vol_id]['is_idle'] = True
+                all_formatted_volumes[vol_id]['idle_reason'] = idle_detail.get('idle_reason')
+                all_formatted_volumes[vol_id]['recommendation'] = idle_detail.get('recommendation')
+                all_formatted_volumes[vol_id]['status'] = "Idle" # 상태 명시
+                processed_idle_ids.add(vol_id)
+            else:
+                # 이론적으로 발생하면 안됨 (모든 볼륨은 volumes_to_process에 있어야 함)
+                logger.warning(f"Idle detector가 반환한 볼륨 ID {vol_id}를 원본 목록에서 찾을 수 없습니다.")
+                results.append(idle_detail) # 일단 추가
 
-            # 추천 액션 결정 로직은 유지 (감지 결과에 따라 달라짐)
-            recommendation = 'none'
-            if formatted_info['is_idle']:
-                recommendation = 'snapshot_and_delete' # 또는 'delete_only'
-            elif formatted_info['is_overprovisioned']:
-                recommendation = 'modify' # 실제로는 세부 타입 제안 필요
+        # TODO: Overprovisioned detector 결과도 유사하게 처리
+        # overprovisioned_details = self.overprovisioned_detector.detect(volumes_to_process)
+        # for ov_detail in overprovisioned_details:
+        #    vol_id = ov_detail['volume_id']
+        #    if vol_id in all_formatted_volumes and vol_id not in processed_idle_ids: # 유휴가 아닌 볼륨에 대해서만
+        #        all_formatted_volumes[vol_id]['is_overprovisioned'] = True
+        #        all_formatted_volumes[vol_id]['overprovisioned_reason'] = ov_detail.get('reason')
+        #        all_formatted_volumes[vol_id]['recommendation'] = ov_detail.get('recommendation')
+        #        all_formatted_volumes[vol_id]['status'] = "Overprovisioned"
 
-            formatted_info['recommendation'] = recommendation
-            analysis_results.append(formatted_info)
+        # 최종 results 리스트 구성
+        for vol_id, vol_data in all_formatted_volumes.items():
+            if 'is_idle' not in vol_data: # 유휴로 처리되지 않은 볼륨
+                vol_data['is_idle'] = False
+                # TODO: is_overprovisioned도 기본값 설정
+                if 'status' not in vol_data: # 유휴도, 과대 프로비저닝도 아니면
+                     vol_data['status'] = "In-use / Optimized"
+                     vol_data['recommendation'] = "볼륨이 현재 사용 중이며 최적화된 것으로 보입니다."
+            results.append(vol_data)
 
-        # 요약 정보 계산 (현재는 0으로 표시될 것임)
-        idle_count = sum(1 for v in analysis_results if v.get('is_idle'))
-        overprovisioned_count = sum(1 for v in analysis_results if v.get('is_overprovisioned'))
-        summary = {
-            "total_volumes": len(volumes_to_process),
-            "idle_count": idle_count,
-            "overprovisioned_count": overprovisioned_count
-        }
 
-        logger.info(f"분석 완료: 전체 {summary['total_volumes']}, 유휴 {summary['idle_count']}, 과대 {summary['overprovisioned_count']}")
+        # 요약 정보 업데이트
+        idle_count = len(idle_volumes_details)
+        # over_count = len(overprovisioned_volumes_details) # 가정
 
         return {
-            "summary": summary,
-            "results": analysis_results
+            "summary": {
+                "total_volumes": len(volumes_to_process),
+                "idle_count": idle_count,
+                # "overprovisioned_count": over_count,
+                "overprovisioned_count": 0, # 임시
+                "errors": [] # TODO: 오류 처리 추가
+            },
+            "results": results
         }
 
-    # analyze_specific_volume 메서드는 analyze_volumes(volume_ids=[...])로 대체 가능
-    # 필요 시 유지 또는 삭제
+    # analyze_specific_volume 메소드는 현재 EBSAnalyzer에 없음.
+    # 만약 Lambda_function.py 등에서 직접 EBSAnalyzer의 특정 메소드를 호출하여 단일 볼륨을 분석한다면,
+    # 해당 로직이 self.idle_detector.is_idle_volume 등을 사용하도록 해야 함.
+    # 지금은 analyze_volumes 내에서 volume_ids 파라미터로 단일/다수 볼륨 처리가 가능하므로,
+    # analyze_specific_volume을 별도로 두기보다 analyze_volumes를 활용하는 것이 일관성 있을 수 있음.
+
     # def analyze_specific_volume(self, volume_id):
-    #     ... (analyze_volumes 호출하도록 구현) 
+    #     """ 특정 볼륨 ID에 대한 상세 분석 """
+    #     # ... (이 부분은 이전 검색 결과의 costnorm_mcp_server/storage/ebs/analyzer/analyzer.py 참고하여 구성 가능)
+    #     # self.idle_detector.is_idle_volume(...) 등을 사용
+    #     pass 

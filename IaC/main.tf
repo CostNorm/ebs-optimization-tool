@@ -13,4 +13,5 @@ module "ebs_optimizer_lambda" {
   #attach_ebs_policy        = true
   attach_ec2_policy        = true
   attach_cloudwatch_policy = true
+  profile = "costnorm"
 }
