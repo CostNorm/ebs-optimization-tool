@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+from datetime import datetime
 
 # 필요한 모듈 임포트
 from analyzer import EBSAnalyzer
@@ -9,6 +10,12 @@ from executor import RecommendationExecutor
 # 로거 설정 (Lambda 환경에 맞게 기본 설정 사용)
 logger = logging.getLogger()
 logger.setLevel(os.environ.get('LOG_LEVEL', 'INFO').upper())
+
+class DateTimeEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        return super().default(obj)
 
 def lambda_handler(event, context):
     """
@@ -81,16 +88,23 @@ def lambda_handler(event, context):
             status_code = 400
             response_body = {'error': f"Unsupported operation: {operation}"}
 
+        # response_body를 JSON으로 직렬화할 때 커스텀 인코더 사용
+        return {
+            'statusCode': status_code,
+            'headers': {
+                'Content-Type': 'application/json'
+            },
+            'body': json.dumps(response_body, cls=DateTimeEncoder)
+        }
+
     except Exception as e:
         logger.error(f"처리 중 예외 발생: {str(e)}", exc_info=True)
-        status_code = 500
-        response_body = {'error': f"Internal server error: {str(e)}"}
-
-    # Lambda Proxy 통합 응답 형식
-    return {
-        'statusCode': status_code,
-        'headers': {
-            'Content-Type': 'application/json'
-        },
-        'body': json.dumps(response_body)
-    } 
+        return {
+            'statusCode': 500,
+            'headers': {
+                'Content-Type': 'application/json'
+            },
+            'body': json.dumps({
+                'error': f"Internal server error: {str(e)}"
+            }, cls=DateTimeEncoder)
+        } 

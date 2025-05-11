@@ -8,55 +8,69 @@ from config import EBS_PRICING # config.py에서 가격 정보 가져오기
 
 logger = logging.getLogger()
 
-def calculate_monthly_cost(size_gb, volume_type, region, iops=None, throughput=None):
+def calculate_monthly_cost(size_gb, volume_type, region_name, iops=None, throughput=None):
     """
-    EBS 볼륨의 월간 비용을 계산합니다. (gp3, io1, io2 비용 계산 개선)
-
-    :param size_gb: 볼륨 크기 (GB)
-    :param volume_type: 볼륨 유형 (gp2, gp3, io1, io2, st1, sc1, standard)
-    :param region: AWS 리전
-    :param iops: 프로비저닝된 IOPS (gp3, io1, io2 용)
-    :param throughput: 프로비저닝된 처리량 (gp3 용, MiBps 단위)
-    :return: 월간 비용 (USD) 또는 None (가격 정보 없을 시)
+    Calculates the estimated monthly cost of an EBS volume.
     """
-    region_prices = EBS_PRICING.get(region, EBS_PRICING.get('default'))
+    # Ensure iops and throughput are numbers if provided
+    current_iops = None
+    if iops is not None:
+        try:
+            current_iops = int(iops)
+        except ValueError:
+            logger.error(f"Invalid value for IOPS: {iops}. Must be a number.")
+            # Decide how to handle: return error, use default, or ignore for cost calculation
+            # For now, let's assume it might affect cost calculation if not default.
+            pass # Or set to a default that doesn't add cost, e.g., 0 or base_iops for gp3
 
-    if not region_prices:
-        logger.warning(f"리전 {region} 또는 기본 리전에 대한 가격 정보를 찾을 수 없습니다.")
-        return None
+    current_throughput = None
+    if throughput is not None:
+        try:
+            current_throughput = int(throughput) # or float if decimal values are possible/expected
+        except ValueError:
+            logger.error(f"Invalid value for Throughput: {throughput}. Must be a number.")
+            # Similar handling as IOPS
+            pass
 
-    storage_price = region_prices.get(volume_type, {}).get('storage')
+    try:
+        pricing_info = EBS_PRICING.get(region_name, EBS_PRICING['default'])
+        type_pricing = pricing_info.get(volume_type)
 
-    if storage_price is None:
-        logger.warning(f"리전 {region}의 볼륨 타입 {volume_type}에 대한 스토리지 가격을 찾을 수 없습니다. gp2 가격으로 대체합니다.")
-        storage_price = region_prices.get('gp2', {}).get('storage', 0.10) # 최종 대체 가격
+        if not type_pricing:
+            logger.warning(f"Pricing for volume type '{volume_type}' in region '{region_name}' not found. Using default gp2 pricing.")
+            type_pricing = EBS_PRICING['default']['gp2']
+            # return 0.0 # Or handle as an error / use a default
 
-    # 기본 스토리지 비용
-    monthly_cost = size_gb * storage_price
+        monthly_cost = float(size_gb) * type_pricing['storage']
 
-    # --- 타입별 추가 비용 계산 --- 
-    if volume_type == 'gp3':
-        # gp3 IOPS 비용 (기본 3000 IOPS 초과분)
-        iops_price = region_prices.get('gp3', {}).get('iops')
-        base_iops = 3000
-        if iops_price and iops and iops > base_iops:
-            monthly_cost += (iops - base_iops) * iops_price
+        if volume_type == 'gp3':
+            gp3_pricing = type_pricing
+            # Default provisioned values for gp3 if not specified (or if free tier)
+            # AWS provides 3,000 IOPS and 125 MiBps free with gp3 storage
+            base_iops = 3000 
+            base_throughput = 125  # MiBps
+
+            # Calculate cost for IOPS provisioned above the free tier
+            if current_iops is not None and gp3_pricing.get('iops') and current_iops > base_iops:
+                monthly_cost += (current_iops - base_iops) * gp3_pricing['iops']
+            
+            # Calculate cost for throughput provisioned above the free tier
+            if current_throughput is not None and gp3_pricing.get('throughput') and current_throughput > base_throughput:
+                monthly_cost += (current_throughput - base_throughput) * gp3_pricing['throughput']
         
-        # gp3 Throughput 비용 (기본 125 MiBps 초과분)
-        throughput_price = region_prices.get('gp3', {}).get('throughput')
-        base_throughput = 125
-        if throughput_price and throughput and throughput > base_throughput:
-             # 가격은 보통 $/MiBps-월 단위
-             monthly_cost += (throughput - base_throughput) * throughput_price
+        elif volume_type in ['io1', 'io2']:
+            # io1 and io2 have provisioned IOPS costs
+            if current_iops is not None and type_pricing.get('iops'):
+                monthly_cost += current_iops * type_pricing['iops']
+        
+        # For other volume types like gp2, st1, sc1, standard, cost is mainly based on storage.
+        # (Additional logic for specific features of those types could be added if necessary)
 
-    elif volume_type in ['io1', 'io2']:
-        # io1/io2 IOPS 비용
-        iops_price = region_prices.get(volume_type, {}).get('iops')
-        if iops_price and iops:
-            monthly_cost += iops * iops_price
-        # io2 Block Express 는 다른 요금 체계 (여기서는 기본 io2 가정)
+        return round(monthly_cost, 2)
 
-    return round(monthly_cost, 2) # 소수점 2자리까지 반환
+    except Exception as e:
+        logger.error(f"Error calculating monthly cost for size {size_gb}GB, type {volume_type}, region {region_name}: {str(e)}", exc_info=True)
+        return 0.0  # Return 0 or raise error on failure
 
 def get_tags_as_dict(tags_list):
     """
