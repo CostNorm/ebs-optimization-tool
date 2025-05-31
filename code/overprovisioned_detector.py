@@ -180,15 +180,21 @@ class OverprovisionedVolumeDetector:
             ssm_status, message = self.check_instance_ssm_status(instance_id)
             if ssm_status:
                 # SSM을 통해 디스크 사용률 조회 시도
-                return self.get_disk_usage_via_ssm(instance_id, device_name)
+                ssm_disk_usage = self.get_disk_usage_via_ssm(instance_id, device_name)
+                if ssm_disk_usage:
+                    return ssm_disk_usage
+                else: # SSM 조회도 실패
+                    logger.warning(f"SSM을 통해서도 인스턴스 {instance_id}, 디바이스 {device_name}의 디스크 사용률을 가져올 수 없습니다. 사용률 데이터 없음으로 처리합니다.")
+                    return None # 수정: 추정치 대신 None 반환
             else:
-                logger.warning(f"SSM을 사용할 수 없습니다: {message}. 추정치 사용...")
-                return self.get_estimated_disk_usage(instance_id, device_name)
+                logger.warning(f"SSM을 사용할 수 없습니다: {message}. 사용률 데이터 없음으로 처리합니다.")
+                return None # 수정: 추정치 대신 None 반환
             
         except Exception as e:
             logger.error(f"CloudWatch 메트릭 조회 중 오류 발생: {str(e)}", exc_info=True)
-            # 오류 발생 시 추정 데이터 사용
-            return self.get_estimated_disk_usage(instance_id, device_name)
+            # 오류 발생 시 None 반환
+            logger.warning(f"CloudWatch 메트릭 조회 오류로 인해 인스턴스 {instance_id}, 디바이스 {device_name}의 디스크 사용률을 가져올 수 없습니다. 사용률 데이터 없음으로 처리합니다.")
+            return None # 수정: 추정치 대신 None 반환
     
     def estimate_filesystem_path(self, device_name, available_paths):
         """
@@ -328,18 +334,18 @@ class OverprovisionedVolumeDetector:
             
     def get_estimated_disk_usage(self, instance_id, device_name):
         """
-        다른 방법으로 디스크 사용률을 가져올 수 없을 때, 추정치를 반환 (예: 0%)
+        다른 방법으로 디스크 사용률을 가져올 수 없을 때, None을 반환합니다.
         이 함수는 모든 다른 방법이 실패했을 때 최후의 수단으로 사용됩니다.
-        실제 사용률을 반영하지 않으므로, 이 결과에 의존하는 것은 권장되지 않습니다.
+        호출된다는 것은 데이터 수집에 문제가 있음을 의미합니다.
         
         :param instance_id: EC2 인스턴스 ID
         :param device_name: 디바이스 이름
-        :return: 추정된 디스크 사용률 데이터포인트 리스트
+        :return: None
         """
-        logger.warning(f"인스턴스 {instance_id}, 디바이스 {device_name}의 디스크 사용률을 정확히 알 수 없습니다. 추정치(0%)를 사용합니다.")
+        logger.warning(f"get_estimated_disk_usage 호출됨: 인스턴스 {instance_id}, 디바이스 {device_name}의 디스크 사용률을 정확히 알 수 없습니다. 이는 데이터 수집 경로에 문제가 있음을 나타냅니다. 사용률 데이터 없음(None)으로 처리합니다.")
         # 실제로는 이 값을 0으로 설정하면 항상 과대 프로비저닝으로 판단될 수 있으므로 주의 필요
         # 또는 특정 상황에서는 분석에서 제외하거나, 사용자에게 알림을 보내는 등의 처리가 필요할 수 있습니다.
-        return [{'Timestamp': datetime.now(), 'Average': 0.0, 'Unit': 'Percent'}] 
+        return None # 수정: 0% 대신 None 반환
 
     # ---- HELPER FUNCTIONS ----
     
@@ -616,8 +622,9 @@ class OverprovisionedVolumeDetector:
         주로 IOPS, Throughput 기준으로 판단했음.
         여기서는 storage_optimizer_by_metrics의 로직을 일부 차용.
         """
-        if not usage_datapoints:
+        if not usage_datapoints: # 사용률 데이터를 가져오지 못한 경우 (None 또는 빈 리스트)
             logger.warning("디스크 사용률 데이터가 없어 과대 프로비저닝(크기) 판단 불가.")
+            # 반환 값: (과대 프로비저닝 여부, 사유, 사용률 요약, 권장 크기)
             return False, "사용률 데이터 없음", {}, None # 최적 크기 None
 
         # === 디버깅 로그 추가 시작 ===
@@ -725,47 +732,23 @@ class OverprovisionedVolumeDetector:
             # 디스크 사용률 지표 가져오기
             # 이 함수는 CloudWatch 에이전트 메트릭 또는 SSM Run Command를 사용할 수 있습니다.
             usage_datapoints = self.get_disk_usage_metrics(instance_id, device_name, start_time, end_time)
-
-            if not usage_datapoints:
-                logger.warning(f"볼륨 {volume_id} (인스턴스 {instance_id}, 디바이스 {device_name})의 디스크 사용률 데이터를 가져올 수 없습니다. 분석 건너뛰기.")
-                continue
-
-            is_over, avg_usage, num_dp, reason = self.is_overprovisioned(usage_datapoints, volume['Size'])
             
-            # 디스크 사용률 데이터 요약 (최근, 평균, 최대)
-            usage_summary = {
-                'average_usage_percent': avg_usage,
-                'datapoints_count': num_dp,
-                'collection_period_days': (end_time - start_time).days,
-                'raw_datapoints': usage_datapoints # 디버깅 또는 상세 분석용
-            }
-            if usage_datapoints:
-                 usage_summary['latest_usage_percent'] = usage_datapoints[-1]['Average'] # 마지막 데이터포인트
-                 usage_summary['max_usage_percent'] = max(dp['Average'] for dp in usage_datapoints)
-
-            if is_over:
-                logger.info(f"볼륨 {volume_id}이 과대 프로비저닝된 것으로 감지됨: {reason}")
+            # 사용률 데이터를 가져오지 못한 경우 초기 분석 결과 반환
+            if usage_datapoints is None:
+                logger.warning(f"볼륨 {volume_id}의 디스크 사용률 데이터 없음. 크기 분석은 건너뛰기.")
                 current_size = volume['Size']
                 volume_type = volume['VolumeType']
                 iops = volume.get('Iops')
                 throughput = volume.get('Throughput')
-                
-                # 현재 월간 비용 계산
                 current_cost = calculate_monthly_cost(current_size, volume_type, self.region, iops, throughput)
                 
-                # 권장 크기 및 비용 계산
-                recommended_size, recommended_cost = self.recommend_volume_size_and_cost(
-                    usage_summary, current_size, volume_type, self.region, iops, throughput
+                # 성능 분석은 시도 가능
+                performance_metrics = self.get_performance_metrics(volume_id, start_time, end_time)
+                is_perf_over, perf_reason = self.is_performance_overprovisioned(
+                    performance_metrics, volume_type, iops, throughput
                 )
                 
-                estimated_savings = (current_cost - recommended_cost) if current_cost is not None and recommended_cost is not None else 0
-                
-                # 성능 메트릭 기반 추가 분석 (IOPS, Throughput)
-                # (이 부분은 필요에 따라 추가 개발)
-                # performance_metrics = self.get_performance_metrics(volume_id, start_time, end_time)
-                # is_perf_over, perf_reason = self.is_performance_overprovisioned(performance_metrics, volume_type, iops, throughput)
-                
-                overprovisioned_volumes.append({
+                return {
                     'volume_id': volume_id,
                     'instance_id': instance_id,
                     'device_name': device_name,
@@ -776,16 +759,119 @@ class OverprovisionedVolumeDetector:
                     'current_iops': iops,
                     'current_throughput': throughput,
                     'current_monthly_cost': current_cost,
-                    'disk_usage_data': usage_summary,
-                    'overprovisioned_reason': reason,
-                    'recommended_size_gb': recommended_size,
-                    'recommended_monthly_cost': recommended_cost,
-                    'estimated_monthly_savings': round(estimated_savings, 2) if estimated_savings > 0 else 0,
-                    'recommendation': f"볼륨 크기를 {recommended_size}GB로 조정하여 월 ${estimated_savings:.2f} 절감 가능"
-                })
-            else:
-                logger.info(f"볼륨 {volume_id}은(는) 과대 프로비저닝되지 않았습니다: {reason}")
+                    'disk_usage_status': 'unavailable',
+                    'disk_usage_error_reason': 'Failed to retrieve disk usage from CWAgent and SSM.',
+                    'disk_usage_data': {},
+                    'is_size_overprovisioned': False,
+                    'size_overprovisioned_reason': 'Disk usage data not available',
+                    'recommended_size_gb': current_size, # 변경 권장 없음
+                    'recommended_monthly_cost': current_cost, # 현재 비용과 동일
+                    'estimated_monthly_savings': 0, # 크기 절감액 없음
+                    'is_performance_overprovisioned': is_perf_over,
+                    'performance_overprovisioned_reason': perf_reason,
+                    'recommendation': f"디스크 사용량 정보를 가져올 수 없어 크기 최적화 권장은 제공되지 않습니다. {perf_reason if is_perf_over else '성능 문제는 발견되지 않았습니다.'}",
+                    'is_overprovisioned': is_perf_over # 성능만으로 과대 프로비저닝 여부 판단
+                }
 
+            # is_overprovisioned 반환 값 변경: is_size_over, size_reason, usage_summary_from_is_over, recommended_size_from_is_over
+            is_size_over, size_reason, usage_summary_from_is_over, recommended_size_from_is_over = self.is_overprovisioned(usage_datapoints, volume['Size'])
+            
+            # 디스크 사용률 데이터 요약
+            avg_usage = 0
+            num_dp = 0
+            latest_usage = 0
+            max_usage = 0
+            if usage_datapoints:
+                try:
+                    avg_values = [dp.get('Average', 0) for dp in usage_datapoints]
+                    avg_usage = sum(avg_values) / len(avg_values) if avg_values else 0
+                    num_dp = len(usage_datapoints)
+                    latest_usage = usage_datapoints[-1]['Average'] if usage_datapoints else 0
+                    max_usage = max(dp['Average'] for dp in usage_datapoints) if usage_datapoints else 0
+                except (TypeError, KeyError, IndexError) as e:
+                    logger.error(f"볼륨 {volume_id}의 단일 분석 사용률 데이터 요약 중 오류: {e}, 데이터: {usage_datapoints}")
+
+            usage_summary = {
+                'average_usage_percent': avg_usage,
+                'datapoints_count': num_dp,
+                'collection_period_days': (end_time - start_time).days,
+                'latest_usage_percent': latest_usage,
+                'max_usage_percent': max_usage,
+            }
+
+            current_size = volume['Size']
+            volume_type = volume['VolumeType']
+            iops = volume.get('Iops')
+            throughput = volume.get('Throughput')
+            current_cost = calculate_monthly_cost(current_size, volume_type, self.region, iops, throughput)
+            
+            recommended_size = current_size
+            recommended_cost = current_cost
+            estimated_savings = 0
+            final_recommendation = ""
+
+            if is_size_over:
+                logger.info(f"볼륨 {volume_id}이(가) 크기 면에서 과대 프로비저닝된 것으로 감지됨: {size_reason}")
+                # is_overprovisioned에서 반환된 recommended_size 사용 또는 여기서 다시 계산
+                # 여기서는 recommend_volume_size_and_cost를 다시 호출하여 일관성 유지
+                temp_recommended_size, temp_recommended_cost = self.recommend_volume_size_and_cost(
+                    usage_summary, current_size, volume_type, self.region, iops, throughput
+                )
+                if temp_recommended_size < current_size: # 축소 권장이 있을 경우에만 업데이트
+                    recommended_size = temp_recommended_size
+                    recommended_cost = temp_recommended_cost
+                    estimated_savings = (current_cost - recommended_cost) if current_cost is not None and recommended_cost is not None else 0
+                    final_recommendation = f"볼륨 크기를 {recommended_size}GB로 조정하여 월 ${estimated_savings:.2f} 절감 가능. {size_reason}"
+                else:
+                    # is_overprovisioned는 True를 반환했지만, recommend_volume_size_and_cost에서 축소 권장이 나오지 않은 경우
+                    is_size_over = False # 실제로는 과대 프로비저닝이 아님 (또는 권장할 만큼 크지 않음)
+                    size_reason = f"낮은 사용률에도 불구하고, 권장 크기({temp_recommended_size}GB)가 현재 크기({current_size}GB)보다 작지 않아 크기 조정 권장 안 함."
+                    final_recommendation = size_reason
+            else:
+                logger.info(f"볼륨 {volume_id}은(는) 크기 면에서 과대 프로비저닝되지 않았습니다: {size_reason}")
+                final_recommendation = size_reason
+                
+            # 성능 메트릭 기반 추가 분석 (IOPS, Throughput)
+            # 성능 분석은 디스크 사용량 데이터 유무와 관계없이 수행 가능
+            # is_perf_over, perf_reason = False, "성능 분석은 현재 비활성화됨" # 임시
+            performance_metrics = self.get_performance_metrics(volume_id, start_time, end_time)
+            is_perf_over, perf_reason = self.is_performance_overprovisioned(performance_metrics, volume_type, iops, throughput)
+            
+            if is_perf_over:
+                logger.info(f"볼륨 {volume_id}이(가) 성능 면에서 과대 프로비저닝된 것으로 감지됨: {perf_reason}")
+                if final_recommendation and not final_recommendation.startswith("현재 사용률이") : # 이미 크기 관련 메시지가 있으면 추가
+                    final_recommendation += f" 또한, {perf_reason}"
+                else: # 크기 관련 메시지가 없거나, 판단 불가 메시지면 새로 작성
+                    final_recommendation = perf_reason
+                # 성능 최적화 권장 (예: gp3로 변경, IOPS/처리량 조정)은 여기서 구체화 가능
+            
+            # 최종 결과 객체 구성
+            result_item = {
+                'volume_id': volume_id,
+                'instance_id': instance_id,
+                'device_name': device_name,
+                'region': self.region,
+                'name': next((tag['Value'] for tag in volume.get('Tags', []) if tag['Key'] == 'Name'), 'N/A'),
+                'current_size_gb': current_size,
+                'volume_type': volume_type,
+                'current_iops': iops,
+                'current_throughput': throughput,
+                'current_monthly_cost': current_cost,
+                'disk_usage_status': 'available' if usage_datapoints else 'unavailable',
+                'disk_usage_error_reason': None if usage_datapoints else 'Failed to retrieve disk usage from CWAgent and SSM.',
+                'disk_usage_data': usage_summary if usage_datapoints else {},
+                'overprovisioned_reason': size_reason if usage_datapoints else 'Disk usage data not available',
+                'recommended_size_gb': recommended_size if is_size_over and usage_datapoints else current_size,
+                'recommended_monthly_cost': recommended_cost if is_size_over and usage_datapoints else current_cost,
+                'estimated_monthly_savings': round(estimated_savings, 2) if is_size_over and usage_datapoints and estimated_savings > 0 else 0,
+                'is_size_overprovisioned': is_size_over and usage_datapoints, # 사용량 데이터가 있어야 크기 과대프로비저닝 판단 가능
+                'is_performance_overprovisioned': is_perf_over,
+                'performance_overprovisioned_reason': perf_reason,
+                'recommendation': final_recommendation if final_recommendation else "분석 결과 특이사항 없음.",
+                'is_overprovisioned': (is_size_over and usage_datapoints) or is_perf_over # 최종 과대 프로비저닝 여부
+            }
+            overprovisioned_volumes.append(result_item)
+            
         return overprovisioned_volumes
 
     def recommend_volume_size_and_cost(self, usage_summary, current_size, volume_type, region, current_iops=None, current_throughput=None):
@@ -998,20 +1084,72 @@ class OverprovisionedVolumeDetector:
         device_name = attachments[0]['Device']
         
         usage_datapoints = self.get_disk_usage_metrics(instance_id, device_name, start_time, end_time)
-        if not usage_datapoints:
-            logger.warning(f"볼륨 {volume_id}의 디스크 사용률 데이터 없음. 분석 건너뛰기.")
-            return None
-
-        is_size_over, avg_usage, num_dp, size_reason = self.is_overprovisioned(usage_datapoints, volume['Size'])
         
+        # 사용률 데이터를 가져오지 못한 경우 초기 분석 결과 반환
+        if usage_datapoints is None:
+            logger.warning(f"볼륨 {volume_id}의 디스크 사용률 데이터 없음. 크기 분석은 건너뛰기.")
+            current_size = volume['Size']
+            volume_type = volume['VolumeType']
+            iops = volume.get('Iops')
+            throughput = volume.get('Throughput')
+            current_cost = calculate_monthly_cost(current_size, volume_type, self.region, iops, throughput)
+            
+            # 성능 분석은 시도 가능
+            performance_metrics = self.get_performance_metrics(volume_id, start_time, end_time)
+            is_perf_over, perf_reason = self.is_performance_overprovisioned(
+                performance_metrics, volume_type, iops, throughput
+            )
+            
+            return {
+                'volume_id': volume_id,
+                'instance_id': instance_id,
+                'device_name': device_name,
+                'region': self.region,
+                'name': next((tag['Value'] for tag in volume.get('Tags', []) if tag['Key'] == 'Name'), 'N/A'),
+                'current_size_gb': current_size,
+                'volume_type': volume_type,
+                'current_iops': iops,
+                'current_throughput': throughput,
+                'current_monthly_cost': current_cost,
+                'disk_usage_status': 'unavailable',
+                'disk_usage_error_reason': 'Failed to retrieve disk usage from CWAgent and SSM.',
+                'disk_usage_data': {},
+                'is_size_overprovisioned': False,
+                'size_overprovisioned_reason': 'Disk usage data not available',
+                'recommended_size_gb': current_size, # 변경 권장 없음
+                'recommended_monthly_cost': current_cost, # 현재 비용과 동일
+                'estimated_monthly_savings': 0, # 크기 절감액 없음
+                'is_performance_overprovisioned': is_perf_over,
+                'performance_overprovisioned_reason': perf_reason,
+                'recommendation': f"디스크 사용량 정보를 가져올 수 없어 크기 최적화 권장은 제공되지 않습니다. {perf_reason if is_perf_over else '성능 문제는 발견되지 않았습니다.'}",
+                'is_overprovisioned': is_perf_over # 성능만으로 과대 프로비저닝 여부 판단
+            }
+
+        # is_overprovisioned 반환 값 변경: is_size_over, size_reason, usage_summary_from_is_over, recommended_size_from_is_over
+        is_size_over, size_reason, usage_summary_from_is_over, recommended_size_from_is_over = self.is_overprovisioned(usage_datapoints, volume['Size'])
+        
+        # 디스크 사용률 데이터 요약
+        avg_usage = 0
+        num_dp = 0
+        latest_usage = 0
+        max_usage = 0
+        if usage_datapoints:
+            try:
+                avg_values = [dp.get('Average', 0) for dp in usage_datapoints]
+                avg_usage = sum(avg_values) / len(avg_values) if avg_values else 0
+                num_dp = len(usage_datapoints)
+                latest_usage = usage_datapoints[-1]['Average'] if usage_datapoints else 0
+                max_usage = max(dp['Average'] for dp in usage_datapoints) if usage_datapoints else 0
+            except (TypeError, KeyError, IndexError) as e:
+                logger.error(f"볼륨 {volume_id}의 단일 분석 사용률 데이터 요약 중 오류: {e}, 데이터: {usage_datapoints}")
+
         usage_summary = {
             'average_usage_percent': avg_usage,
             'datapoints_count': num_dp,
             'collection_period_days': (end_time - start_time).days,
+            'latest_usage_percent': latest_usage,
+            'max_usage_percent': max_usage,
         }
-        if usage_datapoints:
-            usage_summary['latest_usage_percent'] = usage_datapoints[-1]['Average']
-            usage_summary['max_usage_percent'] = max(dp['Average'] for dp in usage_datapoints)
 
         current_size = volume['Size']
         volume_type = volume['VolumeType']
@@ -1037,9 +1175,11 @@ class OverprovisionedVolumeDetector:
             'current_iops': iops,
             'current_throughput': throughput,
             'current_monthly_cost': current_cost,
-            'disk_usage_data': usage_summary,
+            'disk_usage_status': 'available' if usage_datapoints else 'unavailable',
+            'disk_usage_error_reason': None if usage_datapoints else 'Failed to retrieve disk usage from CWAgent and SSM.',
+            'disk_usage_data': usage_summary if usage_datapoints else {},
             'is_size_overprovisioned': is_size_over,
-            'size_overprovisioned_reason': size_reason if is_size_over else "N/A",
+            'size_overprovisioned_reason': size_reason if is_size_over else "크기 면에서는 과대 프로비저닝되지 않았음",
             'is_performance_overprovisioned': is_perf_over,
             'performance_overprovisioned_reason': perf_reason if is_perf_over else "N/A",
             'recommendation': "",
